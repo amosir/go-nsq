@@ -46,15 +46,15 @@ func isValidName(name string) bool {
 // ReadResponse is a client-side utility function to read from the supplied Reader
 // according to the NSQ protocol spec:
 //
-//    [x][x][x][x][x][x][x][x]...
-//    |  (int32) || (binary)
-//    |  4-byte  || N-byte
-//    ------------------------...
-//        size       data
+//	[x][x][x][x][x][x][x][x]...
+//	|  (int32) || (binary)
+//	|  4-byte  || N-byte
+//	------------------------...
+//	    size       data
 func ReadResponse(r io.Reader, maxMsgSize int32) ([]byte, error) {
 	var msgSize int32
 
-	// message size
+	// 消息大小占 4 字节，这里使用大端字节序是因为常用的网络协议（如TCP/IP）通常使用大端字节序
 	err := binary.Read(r, binary.BigEndian, &msgSize)
 	if err != nil {
 		return nil, err
@@ -64,6 +64,7 @@ func ReadResponse(r io.Reader, maxMsgSize int32) ([]byte, error) {
 		return nil, fmt.Errorf("response msg size is negative: %v", msgSize)
 	}
 
+	// 对消息大小进行校验
 	if maxMsgSize > 0 && msgSize > maxMsgSize {
 		if msgSize == httpResponseMsgSize {
 			return nil, fmt.Errorf("unexpected HTTP response, a nsqd TCP endpoint is required")
@@ -71,7 +72,7 @@ func ReadResponse(r io.Reader, maxMsgSize int32) ([]byte, error) {
 		return nil, fmt.Errorf("response msg size %v exceeds configured maximum (%v)", msgSize, maxMsgSize)
 	}
 
-	// message binary data
+	// 读取消息内容
 	buf := make([]byte, msgSize)
 	_, err = io.ReadFull(r, buf)
 	if err != nil {
@@ -84,11 +85,11 @@ func ReadResponse(r io.Reader, maxMsgSize int32) ([]byte, error) {
 // UnpackResponse is a client-side utility function that unpacks serialized data
 // according to NSQ protocol spec:
 //
-//    [x][x][x][x][x][x][x][x]...
-//    |  (int32) || (binary)
-//    |  4-byte  || N-byte
-//    ------------------------...
-//      frame ID     data
+//	[x][x][x][x][x][x][x][x]...
+//	|  (int32) || (binary)
+//	|  4-byte  || N-byte
+//	------------------------...
+//	  frame ID     data
 //
 // Returns a triplicate of: frame type, data ([]byte), error
 func UnpackResponse(response []byte) (int32, []byte, error) {

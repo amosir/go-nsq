@@ -14,10 +14,14 @@ var byteSpace = []byte(" ")
 var byteNewLine = []byte("\n")
 
 // Command represents a command from a client to an NSQ daemon
+// 客户端发送的指令
 type Command struct {
-	Name   []byte
+	// 指令名，如 Publish 对应 PUB 指令
+	Name []byte
+	// 指令参数，如 topic
 	Params [][]byte
-	Body   []byte
+	// 指令的数据
+	Body []byte
 }
 
 // String returns the name and parameters of the Command
@@ -33,16 +37,19 @@ func (c *Command) String() string {
 //
 // It is suggested that the target Writer is buffered
 // to avoid performing many system calls.
+// 用于将指令按照固定的格式写入到 io.Writer 中
 func (c *Command) WriteTo(w io.Writer) (int64, error) {
 	var total int64
 	var buf [4]byte
 
+	// 写入指令名
 	n, err := w.Write(c.Name)
 	total += int64(n)
 	if err != nil {
 		return total, err
 	}
 
+	// 指令名和参数之间用空格分类，不同的参数之间用空格分开
 	for _, param := range c.Params {
 		n, err := w.Write(byteSpace)
 		total += int64(n)
@@ -56,6 +63,7 @@ func (c *Command) WriteTo(w io.Writer) (int64, error) {
 		}
 	}
 
+	// 指令数据单独在新的行中
 	n, err = w.Write(byteNewLine)
 	total += int64(n)
 	if err != nil {
@@ -64,12 +72,15 @@ func (c *Command) WriteTo(w io.Writer) (int64, error) {
 
 	if c.Body != nil {
 		bufs := buf[:]
+		// 数据长度固定 4 字节
 		binary.BigEndian.PutUint32(bufs, uint32(len(c.Body)))
+		// 写入数据长度
 		n, err := w.Write(bufs)
 		total += int64(n)
 		if err != nil {
 			return total, err
 		}
+		// 写入具体的数据
 		n, err = w.Write(c.Body)
 		total += int64(n)
 		if err != nil {
@@ -104,6 +115,7 @@ func Auth(secret string) (*Command, error) {
 }
 
 // Register creates a new Command to add a topic/channel for the connected nsqd
+// 用于注册新的 topic 和 channel
 func Register(topic string, channel string) *Command {
 	params := [][]byte{[]byte(topic)}
 	if len(channel) > 0 {

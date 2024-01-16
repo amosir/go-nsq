@@ -24,9 +24,13 @@ type producerConn interface {
 // A Producer instance is 1:1 with a destination `nsqd`
 // and will lazily connect to that instance (and re-connect)
 // when Publish commands are executed.
+// 消息生产者
 type Producer struct {
-	id     int64
-	addr   string
+	// 生产者标识
+	id int64
+	// 连接的 nsqd 服务的地址
+	addr string
+	// 与 nsqd 之间的连接，对应 conn.go 中的 Conn 结构
 	conn   producerConn
 	config Config
 
@@ -34,19 +38,28 @@ type Producer struct {
 	logLvl   LogLevel
 	logGuard sync.RWMutex
 
+	// 用于接收服务端响应
 	responseChan chan []byte
-	errorChan    chan []byte
-	closeChan    chan int
+	// 用于接收错误
+	errorChan chan []byte
+	// 用于接收生产者关闭信号
+	closeChan chan int
 
+	// router 协程负责与底层的连接交互，producer 和 router 协程之间通过 transactionChan 交互
 	transactionChan chan *ProducerTransaction
-	transactions    []*ProducerTransaction
-	state           int32
+	// 记录正在发送的消息，收到 NSQD 响应后会将该消息从 transactions 中移除
+	transactions []*ProducerTransaction
+	// 连接状态，包括初始化、已连接、连接已关闭
+	state int32
 
+	// 记录当前正在并发发送指令的协程数
 	concurrentProducers int32
-	stopFlag            int32
-	exitChan            chan int
-	wg                  sync.WaitGroup
-	guard               sync.Mutex
+	// 停止标记，调用 Stop 后会将其设置为 1
+	stopFlag int32
+	// 调用 Stop 后会 close 掉该 channel
+	exitChan chan int
+	wg       sync.WaitGroup
+	guard    sync.Mutex
 }
 
 // ProducerTransaction is returned by the async publish methods
@@ -120,8 +133,7 @@ func (w *Producer) Ping() error {
 // The logger parameter is an interface that requires the following
 // method to be implemented (such as the the stdlib log.Logger):
 //
-//    Output(calldepth int, s string)
-//
+//	Output(calldepth int, s string)
 func (w *Producer) SetLogger(l logger, lvl LogLevel) {
 	w.logGuard.Lock()
 	defer w.logGuard.Unlock()
@@ -172,6 +184,7 @@ func (w *Producer) String() string {
 // NOTE: this blocks until completion
 func (w *Producer) Stop() {
 	w.guard.Lock()
+	// 尝试设置 stopFlag，表示已停止
 	if !atomic.CompareAndSwapInt32(&w.stopFlag, 0, 1) {
 		w.guard.Unlock()
 		return
@@ -211,8 +224,7 @@ func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan 
 	return w.sendCommandAsync(cmd, doneChan, args)
 }
 
-// Publish synchronously publishes a message body to the specified topic, returning
-// an error if publish failed
+// 用于同步发送单条消息，底层封装的是 PUB 指令
 func (w *Producer) Publish(topic string, body []byte) error {
 	return w.sendCommand(Publish(topic, body))
 }
@@ -247,6 +259,9 @@ func (w *Producer) DeferredPublishAsync(topic string, delay time.Duration, body 
 	return w.sendCommandAsync(DeferredPublish(topic, delay, body), doneChan, args)
 }
 
+// 这里可知同步发送和异步发送的区别:
+// 1.其实底层都是异步发送
+// 2.同步发送调用异步发送的函数后，会阻塞在 doneChan，直到发生错误或异步发送的协程主动关闭掉 doneChan
 func (w *Producer) sendCommand(cmd *Command) error {
 	doneChan := make(chan *ProducerTransaction)
 	err := w.sendCommandAsync(cmd, doneChan, nil)
@@ -254,17 +269,18 @@ func (w *Producer) sendCommand(cmd *Command) error {
 		close(doneChan)
 		return err
 	}
+	// 这里阻塞等待，直到收到服务端响应，服务端响应会经过 responseChan, doneChan
 	t := <-doneChan
 	return t.Error
 }
 
 func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
 	args []interface{}) error {
-	// keep track of how many outstanding producers we're dealing with
-	// in order to later ensure that we clean them all up...
+	// 发送前增加 1，发送完后减 1
 	atomic.AddInt32(&w.concurrentProducers, 1)
 	defer atomic.AddInt32(&w.concurrentProducers, -1)
 
+	// 首次发送指令时，连接状态还是 StateInit，需要先创建与 NSQD 的连接，并启动 router 协程
 	if atomic.LoadInt32(&w.state) != StateConnected {
 		err := w.connect()
 		if err != nil {
@@ -279,6 +295,7 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	}
 
 	select {
+	// 将指令发往 transactionChan，由 router 协程统一处理，router 协程会调用 Conn.WriteCommand() 将指令发送到服务端
 	case w.transactionChan <- t:
 	case <-w.exitChan:
 		return ErrStopped
@@ -295,6 +312,7 @@ func (w *Producer) connect() error {
 		return ErrStopped
 	}
 
+	// 检查连接状态
 	state := atomic.LoadInt32(&w.state)
 	switch {
 	case state == StateConnected:
@@ -305,6 +323,8 @@ func (w *Producer) connect() error {
 
 	w.log(LogLevelInfo, "(%s) connecting to nsqd", w.addr)
 
+	// 创建连接对象(Conn对象)
+	// 这里为 Conn 对象指定了回调代理 ConnDelegate(包含 producer 对象)，当 Conn 收到来自服务端的响应时，会回调代理的方法，从而触发 Producer 的某些动作
 	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w})
 	w.conn.SetLoggerLevel(w.getLogLevel())
 	format := fmt.Sprintf("%3d (%%s)", w.id)
@@ -312,6 +332,7 @@ func (w *Producer) connect() error {
 		w.conn.SetLoggerForLevel(w.logger[index], LogLevel(index), format)
 	}
 
+	// 与服务端连接，并启动 readLoop 和 writeLoop 协程
 	_, err := w.conn.Connect()
 	if err != nil {
 		w.conn.Close()
@@ -321,6 +342,8 @@ func (w *Producer) connect() error {
 	atomic.StoreInt32(&w.state, StateConnected)
 	w.closeChan = make(chan int)
 	w.wg.Add(1)
+
+	// 启动单独的 router 协程处理上层 producer 的指令，并通过 Conn 与服务端交互
 	go w.router()
 
 	return nil
@@ -340,9 +363,11 @@ func (w *Producer) close() {
 }
 
 func (w *Producer) router() {
+	// for-select方式持续接收指令并处理
 	for {
 		select {
 		case t := <-w.transactionChan:
+			// producer 发布消息时，会通过 sendCommandAsync 将对应的命令写到 transactionChan 中，这里调用 WriteCommand 将命令发往服务端
 			w.transactions = append(w.transactions, t)
 			err := w.conn.WriteCommand(t.cmd)
 			if err != nil {
@@ -350,10 +375,17 @@ func (w *Producer) router() {
 				w.close()
 			}
 		case data := <-w.responseChan:
+			// nsqd 收到 producer 发送的消息后，会响应一个 FrameTypeResponse 类型的帧
+			// producer 底层的 Conn 中收到后，会通过 ConnDelegate 把数据写回到 producer 的 responseChan 中
+			// 这里会做两件事:
+			// 1. 将当前消息对应的 ProducerTransaction 从 transactions 中移除
+			// 2. 向 ProducerTransaction 的 doneChan 写入数据，解除 sendCommand 方法的阻塞
 			w.popTransaction(FrameTypeResponse, data)
 		case data := <-w.errorChan:
+			// 接收到错误
 			w.popTransaction(FrameTypeError, data)
 		case <-w.closeChan:
+			// 关闭指令
 			goto exit
 		case <-w.exitChan:
 			goto exit
@@ -383,6 +415,7 @@ func (w *Producer) popTransaction(frameType int32, data []byte) {
 	if frameType == FrameTypeError {
 		t.Error = ErrProtocol{string(data)}
 	}
+	// 这里将响应推送到 doneChan 中
 	t.finish()
 }
 

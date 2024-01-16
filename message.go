@@ -63,15 +63,19 @@ func (m *Message) HasResponded() bool {
 
 // Finish sends a FIN command to the nsqd which
 // sent this message
+// 支持 ACK 机制，消息完成后调用 Finish，向服务端发送 ACK 指令
+// 倘若服务端超时未收到 ack 响应，则会默认消息已丢失，会重新推送
 func (m *Message) Finish() {
 	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
 		return
 	}
+	// 调用 consumer 的 onMessageFinish 方法，将 ACK 指令写入到 msgResponseChan 中
 	m.Delegate.OnFinish(m)
 }
 
 // Touch sends a TOUCH command to the nsqd which
 // sent this message
+// 用于更新消息的超时时间，避免 nsqd 因长时间未收到消息的 ACK 而将消息加入重试队列
 func (m *Message) Touch() {
 	if m.HasResponded() {
 		return
@@ -140,14 +144,15 @@ func (m *Message) WriteTo(w io.Writer) (int64, error) {
 
 // DecodeMessage deserializes data (as []byte) and creates a new Message
 // message format:
-//  [x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x]...
-//  |       (int64)        ||    ||      (hex string encoded in ASCII)           || (binary)
-//  |       8-byte         ||    ||                 16-byte                      || N-byte
-//  ------------------------------------------------------------------------------------------...
-//    nanosecond timestamp    ^^                   message ID                       message body
-//                         (uint16)
-//                          2-byte
-//                         attempts
+//
+//	[x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x]...
+//	|       (int64)        ||    ||      (hex string encoded in ASCII)           || (binary)
+//	|       8-byte         ||    ||                 16-byte                      || N-byte
+//	------------------------------------------------------------------------------------------...
+//	  nanosecond timestamp    ^^                   message ID                       message body
+//	                       (uint16)
+//	                        2-byte
+//	                       attempts
 func DecodeMessage(b []byte) (*Message, error) {
 	var msg Message
 

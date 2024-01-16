@@ -92,6 +92,7 @@ type Config struct {
 	// used to Initialize, Validate
 	configHandlers []configHandler
 
+	// 连接的超时时间
 	DialTimeout time.Duration `opt:"dial_timeout" default:"1s"`
 
 	// Deadlines for network reads and writes
@@ -208,15 +209,15 @@ func NewConfig() *Config {
 //
 // Calls to Set() that take a time.Duration as an argument can be input as:
 //
-// 	"1000ms" (a string parsed by time.ParseDuration())
-// 	1000 (an integer interpreted as milliseconds)
-// 	1000*time.Millisecond (a literal time.Duration value)
+//	"1000ms" (a string parsed by time.ParseDuration())
+//	1000 (an integer interpreted as milliseconds)
+//	1000*time.Millisecond (a literal time.Duration value)
 //
 // Calls to Set() that take bool can be input as:
 //
-// 	"true" (a string parsed by strconv.ParseBool())
-// 	true (a boolean)
-// 	1 (an int where 1 == true and 0 == false)
+//	"true" (a string parsed by strconv.ParseBool())
+//	true (a boolean)
+//	1 (an int where 1 == true and 0 == false)
 //
 // It returns an error for an invalid option or value.
 func (c *Config) Set(option string, value interface{}) error {

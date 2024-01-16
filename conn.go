@@ -21,11 +21,15 @@ import (
 // IdentifyResponse represents the metadata
 // returned from an IDENTIFY command to nsqd
 type IdentifyResponse struct {
-	MaxRdyCount  int64 `json:"max_rdy_count"`
-	TLSv1        bool  `json:"tls_v1"`
-	Deflate      bool  `json:"deflate"`
-	Snappy       bool  `json:"snappy"`
-	AuthRequired bool  `json:"auth_required"`
+	// 表示消费者可以设置的最大RDY（Ready）计数，即可以同时处理的最大消息数量
+	MaxRdyCount int64 `json:"max_rdy_count"`
+	// 表示是否启用了TLS v1.0
+	TLSv1 bool `json:"tls_v1"`
+	// 表示是否启用了Deflate压缩
+	Deflate bool `json:"deflate"`
+	// 表示是否启用了Snappy压缩
+	Snappy       bool `json:"snappy"`
+	AuthRequired bool `json:"auth_required"`
 }
 
 // AuthResponse represents the metadata
@@ -47,22 +51,34 @@ type msgResponse struct {
 //
 // Conn exposes a set of callbacks for the
 // various events that occur on a connection
+// 代表客户端和 nsqd 之间的一条连接
 type Conn struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	// InFlight 表示客户端已经收到消息，但还未响应服务端 ACK
+	// 这里记录有多少条消息还未 ACK
 	messagesInFlight int64
-	maxRdyCount      int64
-	rdyCount         int64
+	// 单连接的最大 RDY 值
+	maxRdyCount int64
+	// 此连接的当前 RDY 值
+	rdyCount int64
+	// 最近一次将 RDY 更新为非 0 值的时间
 	lastRdyTimestamp int64
+	// 最近一次接收到消息的时间
 	lastMsgTimestamp int64
 
+	// 保护临界资源
 	mtx sync.Mutex
 
 	config *Config
 
+	// 真正的 TCP 连接
 	conn    *net.TCPConn
 	tlsConn *tls.Conn
-	addr    string
+	// 连接的服务端地址
+	addr string
 
+	// 回调代理
+	// 消费者和生产者有不同的回调代理，底层 Conn 从 tcp 流中读取到数据包后，会根据不同的包类型调用不同的回调函数，将底层的事件报告给消费者和生产者
 	delegate ConnDelegate
 
 	logger   []logger
@@ -70,17 +86,22 @@ type Conn struct {
 	logFmt   []string
 	logGuard sync.RWMutex
 
+	// 读写的入口，其实就是底层的 TCP 连接
 	r io.Reader
 	w io.Writer
 
-	cmdChan         chan *Command
+	// 用于接收用户指令的 channel，writeLoop 协程会从 cmdChan 取出指令数据，通过 tcp 连接发送到服务端
+	cmdChan chan *Command
+	// 消费者收到消息后，会对消息进行确认(FIN 和 REQ)，确认的信息暂存到 msgResponseChan，由 writeLoop 协程处理
 	msgResponseChan chan *msgResponse
-	exitChan        chan int
-	drainReady      chan int
+	// 用于控制写协程退出
+	exitChan   chan int
+	drainReady chan int
 
 	closeFlag int32
 	stopper   sync.Once
-	wg        sync.WaitGroup
+	// 保证所有的协程都执行结束才能关闭连接
+	wg sync.WaitGroup
 
 	readLoopRunning int32
 }
@@ -119,8 +140,7 @@ func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
 // The logger parameter is an interface that requires the following
 // method to be implemented (such as the the stdlib log.Logger):
 //
-//    Output(calldepth int, s string)
-//
+//	Output(calldepth int, s string)
 func (c *Conn) SetLogger(l logger, lvl LogLevel, format string) {
 	c.logGuard.Lock()
 	defer c.logGuard.Unlock()
@@ -170,7 +190,9 @@ func (c *Conn) getLogLevel() LogLevel {
 
 // Connect dials and bootstraps the nsqd connection
 // (including IDENTIFY) and returns the IdentifyResponse
+// 客户端实际向服务端发起连接
 func (c *Conn) Connect() (*IdentifyResponse, error) {
+	// 向服务端发起 TCP 连接
 	dialer := &net.Dialer{
 		LocalAddr: c.config.LocalAddr,
 		Timeout:   c.config.DialTimeout,
@@ -180,6 +202,8 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 设置 Conn 结构重要字段
 	c.conn = conn.(*net.TCPConn)
 	c.r = conn
 	c.w = conn
@@ -190,6 +214,7 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 		return nil, fmt.Errorf("[%s] failed to write magic - %s", c.addr, err)
 	}
 
+	// 进行身份验证
 	resp, err := c.identify()
 	if err != nil {
 		return nil, err
@@ -209,7 +234,13 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 
 	c.wg.Add(2)
 	atomic.StoreInt32(&c.readLoopRunning, 1)
+
+	// 这里启动两个 Loop 的优势在于:
+	// 1.解耦发送和接收流程，能够更简单地实现双工通信
+	// 2.通过 for-select 方式，保证两个 loop 能够在监听到退出指令时及时退出
+	// 启动单独的协程接收服务端的响应
 	go c.readLoop()
+	// 启动单独的协程处理向服务端的请求
 	go c.writeLoop()
 	return resp, nil
 }
@@ -366,6 +397,7 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 
 	// check to see if the server was able to respond w/ capabilities
 	// i.e. it was a JSON response
+	// IDENTIFY 命令的响应是 json 格式
 	if data[0] != '{' {
 		return nil, nil
 	}
@@ -380,6 +412,7 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 
 	c.maxRdyCount = resp.MaxRdyCount
 
+	// 升级 TLS_v1
 	if resp.TLSv1 {
 		c.log(LogLevelInfo, "upgrading to TLS")
 		err := c.upgradeTLS(c.config.TlsConfig)
@@ -427,11 +460,14 @@ func (c *Conn) upgradeTLS(tlsConf *tls.Config) error {
 	}
 	conf.ServerName = host
 
+	// 将普通的 TCP 连接升级为 TLS 连接
 	c.tlsConn = tls.Client(c.conn, conf)
+	// 进行TLS握手
 	err = c.tlsConn.Handshake()
 	if err != nil {
 		return err
 	}
+	// 替换掉原本的连接
 	c.r = c.tlsConn
 	c.w = c.tlsConn
 	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
@@ -518,6 +554,7 @@ func (c *Conn) readLoop() {
 			goto exit
 		}
 
+		// 从底层TCP连接中读取响应数据，并确定消息类型、消息体
 		frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 		if err != nil {
 			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
@@ -530,9 +567,12 @@ func (c *Conn) readLoop() {
 			goto exit
 		}
 
+		// 心跳包类型(由 nsqd 服务发送给 consumer 的，生产者不会收到此类包)
 		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) {
 			c.log(LogLevelDebug, "heartbeat received")
+			// 执行心跳消息回调，实际上 producer 和 consumer 执行的都是空操作
 			c.delegate.OnHeartbeat(c)
+			// 向 nsqd 响应心跳包
 			err := c.WriteCommand(Nop())
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
@@ -542,24 +582,34 @@ func (c *Conn) readLoop() {
 			continue
 		}
 
+		// 其他响应消息处理
 		switch frameType {
 		case FrameTypeResponse:
+			// 响应包类型
+			// 客户端(生产者和消费者)向 nsqd 发送命令后，nsqd 服务会返回一个响应包，这里触发不同的回调
+			// 对 producer，会将包的内容暂存到 responseChan 中，由 router 协程进行处理
 			c.delegate.OnResponse(c, data)
 		case FrameTypeMessage:
+			// 消息包类型
+			// nsqd 会将接收到的消息封装为此类包，发送给消费者。此处会触发 consumer 的回调(onConnMessage)，将消息暂存到 incomingMessages 中
 			msg, err := DecodeMessage(data)
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
 				goto exit
 			}
+			// 设置 message 代理，msg 确认时会回调代理
 			msg.Delegate = delegate
 			msg.NSQDAddress = c.String()
 
 			atomic.AddInt64(&c.messagesInFlight, 1)
 			atomic.StoreInt64(&c.lastMsgTimestamp, time.Now().UnixNano())
 
+			// 执行回调，仅限于 consumer，这里会调用 consumer 的onConnMessage方法，将解析出来的消息推入 incomingMessages
 			c.delegate.OnMessage(c, msg)
 		case FrameTypeError:
+			// 错误包类型
+			// nsqd 通过此类型包向生产者报告错误
 			c.log(LogLevelError, "protocol error - %s", data)
 			c.delegate.OnError(c, data)
 		default:
@@ -584,6 +634,7 @@ exit:
 	c.log(LogLevelInfo, "readLoop exiting")
 }
 
+// 负责向服务端发送指令的常驻协程
 func (c *Conn) writeLoop() {
 	for {
 		select {
@@ -593,6 +644,7 @@ func (c *Conn) writeLoop() {
 			close(c.drainReady)
 			goto exit
 		case cmd := <-c.cmdChan:
+			// 客户端发送的命令会写到 cmdChan 中，这里从中取出通过 TCP 连接发送到对端(只有 TOUCH 指令会通过 cmdChan 发送，其他指令都是直接写入到 TCP 流中)
 			err := c.WriteCommand(cmd)
 			if err != nil {
 				c.log(LogLevelError, "error sending command %s - %s", cmd, err)
@@ -600,9 +652,11 @@ func (c *Conn) writeLoop() {
 				continue
 			}
 		case resp := <-c.msgResponseChan:
-			// Decrement this here so it is correct even if we can't respond to nsqd
+			// 调用 Message.OnFinish/Message.Requeue 后，message 会回调代理的方法，最终调到 Conn 的方法，将  FIN/REQ 消息写入 msgResponseChan
 			msgsInFlight := atomic.AddInt64(&c.messagesInFlight, -1)
 
+			// success == true 表示 FIN 消息，success == false 表示 REQ 消息，这里根据不同类型选择调用不同的回调函数，如 OnMessageFinished 或者 OnMessageRequeued
+			// 回调函数中会对计数值进行修改，如 OnMessageFinished 中会将 messagesFinished 计数赠加 1
 			if resp.success {
 				c.log(LogLevelDebug, "FIN %s", resp.msg.ID)
 				c.delegate.OnMessageFinished(c, resp.msg)
@@ -617,6 +671,7 @@ func (c *Conn) writeLoop() {
 				}
 			}
 
+			// 将指令发往服务端
 			err := c.WriteCommand(resp.cmd)
 			if err != nil {
 				c.log(LogLevelError, "error sending command %s - %s", resp.cmd, err)
@@ -730,6 +785,7 @@ func (c *Conn) onMessageFinish(m *Message) {
 }
 
 func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
+	// delay == -1 时，根据当前的尝试发送次数计算一个合适的退避时间
 	if delay == -1 {
 		// linear delay
 		delay = c.config.DefaultRequeueDelay * time.Duration(m.Attempts)
@@ -738,6 +794,7 @@ func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 			delay = c.config.MaxRequeueDelay
 		}
 	}
+	// 否则使用指定的退避时间
 	c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}
 }
 
